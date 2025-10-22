@@ -40,8 +40,7 @@ from typing import List, Tuple
 
 import numpy as np
 import pandas as pd
-from pandas.tseries.frequencies import to_offset
-import matplotlib.pyplot as plt
+
 
 # Optional imports
 try:
@@ -256,7 +255,7 @@ def _build_features(df: pd.DataFrame, chem_symbol: str, lags: int, horizon: str)
     if y_col not in df.columns:
         raise ValueError(f"Target column {y_col} not found in dataset. Available: {[c for c in df.columns if c.startswith('chem_')]}")
 
-    # Target: future return aligned to requested horizon
+
     horizon_n = pd.Timedelta(horizon)
     if horizon_n <= pd.Timedelta(0):
         raise ValueError("horizon must be positive, e.g., '1D'")
