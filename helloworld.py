@@ -40,6 +40,7 @@ from typing import List, Tuple
 
 import numpy as np
 import pandas as pd
+from pandas.tseries.frequencies import to_offset
 import matplotlib.pyplot as plt
 
 # Optional imports
@@ -255,15 +256,51 @@ def _build_features(df: pd.DataFrame, chem_symbol: str, lags: int, horizon: str)
     if y_col not in df.columns:
         raise ValueError(f"Target column {y_col} not found in dataset. Available: {[c for c in df.columns if c.startswith('chem_')]}")
 
-    # Target: future return (shift negative by horizon)
+    # Target: future return aligned to requested horizon
     horizon_n = pd.Timedelta(horizon)
     if horizon_n <= pd.Timedelta(0):
         raise ValueError("horizon must be positive, e.g., '1D'")
 
-    # Convert index to datetime if needed
-    idx = pd.to_datetime(df.index)
-    # Make a one‑step forward target aligned to current day
-    y = df[y_col].shift(-1)  # next period return by default (1 step)
+    df = df.copy()
+    df.index = pd.to_datetime(df.index)
+    idx = pd.DatetimeIndex(df.index)
+
+    if len(idx) < 2:
+        raise ValueError("Dataset must contain at least two timestamps to infer frequency")
+
+    idx_sorted = idx.sort_values()
+    freq = pd.infer_freq(idx_sorted)
+    if freq:
+        offset = to_offset(freq)
+        try:
+            base_delta = pd.Timedelta(offset)
+        except (TypeError, ValueError):
+            if getattr(offset, "delta", None) is not None:
+                base_delta = pd.Timedelta(offset.delta)
+            elif getattr(offset, "nanos", None):
+                base_delta = pd.Timedelta(offset.nanos, unit="ns")
+            else:
+                raise ValueError(f"Unable to convert inferred frequency {freq!r} to a timedelta") from None
+    else:
+        diffs = idx_sorted[1:] - idx_sorted[:-1]
+        diffs = diffs[diffs > pd.Timedelta(0)]
+        if len(diffs) == 0:
+            raise ValueError(
+                "Unable to infer dataset frequency from index; ensure timestamps are monotonic and non-duplicated"
+            )
+        base_delta = diffs.median()
+
+    if base_delta <= pd.Timedelta(0):
+        raise ValueError("Unable to infer a positive base frequency from dataset index")
+
+    steps_ratio = horizon_n / base_delta
+    steps = int(round(steps_ratio))
+    if steps <= 0 or not math.isclose(steps_ratio, steps, rel_tol=1e-6, abs_tol=1e-9):
+        raise ValueError(
+            f"Horizon {horizon} is not an integer multiple of inferred base frequency ({base_delta})"
+        )
+
+    y = df[y_col].shift(-steps)
 
     # Feature set: lagged chem + lagged futures + rolling stats
     X = pd.DataFrame(index=df.index)
