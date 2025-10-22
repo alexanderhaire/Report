@@ -1,0 +1,57 @@
+-- Realized selling price per gallon, monthly
+WITH s AS (
+    SELECT
+        l.ITEMNMBR,
+        l.LOCNCODE,
+        h.DOCDATE                   AS DocDate,
+        EOMONTH(h.DOCDATE)          AS MonthEnd,
+        l.UOFM,
+        CAST(l.QTYSHPPD AS decimal(18,6)) AS QtyOnLine,  -- quantity in the SOP line's UOM
+        CAST(l.XTNDPRCE AS decimal(18,6)) AS ExtPrice,   -- extended price (line revenue)
+        CAST(l.UNITPRCE AS decimal(18,6)) AS UnitPrice   -- listed unit price in that UOM
+    FROM dbo.SOP30300 l
+    JOIN dbo.SOP30200 h
+      ON h.SOPTYPE = l.SOPTYPE AND h.SOPNUMBE = l.SOPNUMBE
+    WHERE l.SOPTYPE = 3                 -- 3 = Invoice (history)
+      AND l.QTYSHPPD > 0                -- shipped quantity
+      AND h.DOCDATE >= '2015-01-01'     -- adjust window
+),
+s2 AS (
+    SELECT
+        s.*,
+        -- Map line UOM or item suffix to gallons per unit.
+        -- Extend this CASE to cover your other containers/UOM names.
+        CASE
+            WHEN s.UOFM LIKE '%250%'      THEN 250.0      -- 250-gal tote
+            WHEN s.UOFM LIKE '%180%'      THEN 180.0      -- 180-gal drum
+            WHEN s.UOFM LIKE '%55%'       THEN 55.0       -- 55-gal drum
+            WHEN s.UOFM LIKE '%5%'        THEN 5.0        -- 5-gal pail
+            WHEN RIGHT(s.ITEMNMBR, 2)='02' THEN 180.0     -- your "02" code = 180 gal
+            WHEN RIGHT(s.ITEMNMBR, 3)='250' THEN 250.0    -- your "250" code = 250 gal
+            ELSE NULL                                   -- unknown: we’ll drop in next step
+        END AS GalPerUnit
+    FROM s
+),
+priced AS (
+    SELECT
+        ITEMNMBR,
+        LOCNCODE,
+        DocDate,
+        MonthEnd,
+        UOFM,
+        QtyOnLine,
+        ExtPrice,
+        UnitPrice,
+        GalPerUnit,
+        CAST(ExtPrice / NULLIF(QtyOnLine, 0)                 AS decimal(18,6)) AS Price_per_UOM,
+        CAST(ExtPrice / NULLIF(QtyOnLine * GalPerUnit, 0)    AS decimal(18,6)) AS Price_per_Gallon
+    FROM s2
+)
+SELECT
+    MonthEnd              AS date,
+    ITEMNMBR              AS symbol,
+    AVG(Price_per_Gallon) AS price
+FROM priced
+WHERE Price_per_Gallon IS NOT NULL          -- drops rows w/ unknown container mapping
+GROUP BY MonthEnd, ITEMNMBR
+ORDER BY MonthEnd, ITEMNMBR;
