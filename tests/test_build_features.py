@@ -1,7 +1,7 @@
 import pandas as pd
 from pandas.testing import assert_series_equal
 
-from helloworld import _build_features
+from chem_futures_linkage import _build_features
 
 
 def test_horizon_two_days_produces_two_step_target():
