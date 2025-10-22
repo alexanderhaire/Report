@@ -36,7 +36,7 @@ Schedule retrains
 
 import argparse, os, json, math, warnings
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -250,6 +250,11 @@ class TrainArgs:
     step: int = 5  # partial_fit every N rows
 
 
+def _model_meta_path(model_path: str) -> str:
+    base, _ = os.path.splitext(model_path)
+    return base + ".json"
+
+
 def _build_features(df: pd.DataFrame, chem_symbol: str, lags: int, horizon: str) -> Tuple[pd.DataFrame, pd.Series]:
     y_col = f"chem_{chem_symbol}"
     if y_col not in df.columns:
@@ -262,8 +267,19 @@ def _build_features(df: pd.DataFrame, chem_symbol: str, lags: int, horizon: str)
 
     # Convert index to datetime if needed
     idx = pd.to_datetime(df.index)
-    # Make a one‑step forward target aligned to current day
-    y = df[y_col].shift(-1)  # next period return by default (1 step)
+    if len(idx) > 1:
+        inferred_steps = pd.Series(idx).diff().dropna()
+        step = inferred_steps.median()
+        if pd.isna(step) or step <= pd.Timedelta(0):
+            step = pd.Timedelta("1D")
+    else:
+        step = pd.Timedelta("1D")
+    if step <= pd.Timedelta(0):
+        step = pd.Timedelta("1D")
+    steps_ahead = max(int(round(horizon_n / step)), 1)
+
+    # Make a forward target aligned to current day based on the requested horizon
+    y = df[y_col].shift(-steps_ahead)
 
     # Feature set: lagged chem + lagged futures + rolling stats
     X = pd.DataFrame(index=df.index)
@@ -291,10 +307,32 @@ def train_streaming(args: TrainArgs):
 
     X, y = _build_features(df, args.symbol, args.lags, args.horizon)
 
+    meta_path = _model_meta_path(args.model)
+    existing_meta = None
+    if os.path.exists(meta_path):
+        try:
+            with open(meta_path) as f:
+                existing_meta = json.load(f)
+        except Exception:
+            existing_meta = None
+
     # If a prior model exists, load it and continue training; else build fresh pipeline
     if os.path.exists(args.model):
         pipe: Pipeline = joblib.load(args.model)
         print("↻ Loaded existing model; continuing training…")
+        if existing_meta is not None:
+            meta_lags = existing_meta.get("lags")
+            meta_horizon = existing_meta.get("horizon")
+            if meta_lags is not None and int(meta_lags) != int(args.lags):
+                raise ValueError(
+                    f"Existing model was trained with lags={meta_lags}; received {args.lags}. "
+                    "Please keep them consistent or retrain a new model."
+                )
+            if meta_horizon is not None and str(meta_horizon) != str(args.horizon):
+                raise ValueError(
+                    f"Existing model was trained with horizon={meta_horizon}; received {args.horizon}. "
+                    "Please keep them consistent or retrain a new model."
+                )
     else:
         pipe = Pipeline([
             ("scaler", StandardScaler(with_mean=True, with_std=True)),
@@ -329,7 +367,20 @@ def train_streaming(args: TrainArgs):
         json.dump(metrics, f, indent=2)
 
     joblib.dump(pipe, args.model)
+
+    metadata = {
+        "symbol": args.symbol,
+        "lags": int(args.lags),
+        "horizon": str(args.horizon),
+        "step": int(args.step),
+        "dataset": os.path.abspath(args.dataset),
+        "n_features": int(X.shape[1]),
+    }
+    with open(meta_path, "w") as f:
+        json.dump(metadata, f, indent=2)
+
     print(f"✅ Trained model saved to {args.model}")
+    print(f"🗒️  Training metadata written to {meta_path}")
     print("📊 Metrics:", metrics)
 
 
@@ -340,12 +391,28 @@ class PredictArgs:
     dataset: str
     symbol: str
     model: str
+    lags: Optional[int] = None
+    horizon: Optional[str] = None
 
 
 def predict_next(args: PredictArgs):
     df = pd.read_parquet(args.dataset)
     pipe: Pipeline = joblib.load(args.model)
-    X, y = _build_features(df, args.symbol, lags=5, horizon="1D")  # lags/horizon must match training
+    meta_path = _model_meta_path(args.model)
+    meta = {}
+    if os.path.exists(meta_path):
+        try:
+            with open(meta_path) as f:
+                meta = json.load(f)
+        except Exception:
+            meta = {}
+
+    lags = args.lags if args.lags is not None else meta.get("lags")
+    horizon = args.horizon if args.horizon is not None else meta.get("horizon")
+    if lags is None or horizon is None:
+        raise ValueError("Unable to determine lags/horizon for prediction. Provide --lags/--horizon or ensure metadata JSON exists.")
+
+    X, y = _build_features(df, args.symbol, lags=int(lags), horizon=str(horizon))
     latest_x = X.iloc[[-1]]
     pred = float(pipe.predict(latest_x)[0])
     print(json.dumps({"symbol": args.symbol, "predicted_next_return": pred}))
@@ -383,6 +450,8 @@ def main():
     spred.add_argument("--dataset", required=True)
     spred.add_argument("--symbol", required=True)
     spred.add_argument("--model", required=True)
+    spred.add_argument("--lags", type=int, help="Override lag setting (defaults to model metadata)")
+    spred.add_argument("--horizon", help="Override horizon setting (defaults to model metadata)")
 
     args = ap.parse_args()
 
@@ -393,7 +462,7 @@ def main():
     elif args.cmd == "train":
         train_streaming(TrainArgs(args.dataset, args.symbol, args.horizon, args.lags, args.outdir, args.model, args.step))
     elif args.cmd == "predict":
-        predict_next(PredictArgs(args.dataset, args.symbol, args.model))
+        predict_next(PredictArgs(args.dataset, args.symbol, args.model, args.lags, args.horizon))
 
 if __name__ == "__main__":
     main()
